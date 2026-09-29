@@ -82,6 +82,22 @@ docker run -p 8080:8080 \
 
 See [DEPLOY.md](DEPLOY.md) for full GitHub App setup and Azure Container Apps deployment instructions.
 
+## Code checks
+
+Every Rust source file carries an Apache-2.0 license header, matching the
+convention in [hyperlight](https://github.com/hyperlight-dev/hyperlight):
+
+```rust
+// SPDX-License-Identifier: Apache-2.0
+// Copyright <year> The Hyperlight Authors.
+```
+
+This is enforced in CI by the **Code checks** workflow, and can be run locally:
+
+```bash
+./dev/check-license-headers.sh
+```
+
 ## Logging
 
 Set the `RUST_LOG` environment variable to control log verbosity:
