@@ -63,6 +63,10 @@ APP_NAME="hyperlight-gh-bot"
 KEY_VAULT="hyperlight-gh-bot-kv"
 ```
 
+> Key Vault names are globally unique across all of Azure, so `$KEY_VAULT` may
+> already be taken. Pick another name if `az keyvault create` reports a
+> conflict.
+
 ### Create resource group
 
 ```bash
@@ -110,12 +114,53 @@ az keyvault secret show --vault-name $KEY_VAULT --name github-webhook-secret --q
 
 ### Create Container Apps environment
 
+Some subscriptions have a policy requiring Container Apps environments to be
+VNet-injected, rejecting a plain environment with:
+
+```
+(RequestDisallowedByPolicy) ... http://aka.ms/acatsgfornonvnetenv
+```
+
+Create the network first. The infrastructure subnet must be dedicated to
+Container Apps and delegated to it. A `/27` is the minimum for workload-profile
+environments; a `/23` leaves room to grow, and subnets cannot be resized later.
+
 ```bash
+az network vnet create \
+  --resource-group $RESOURCE_GROUP \
+  --name "$APP_NAME-vnet" \
+  --location $LOCATION \
+  --address-prefixes 10.0.0.0/16 \
+  --subnet-name containerapps-infra \
+  --subnet-prefixes 10.0.0.0/23
+
+az network vnet subnet update \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name "$APP_NAME-vnet" \
+  --name containerapps-infra \
+  --delegations Microsoft.App/environments
+
+SUBNET_ID=$(az network vnet subnet show \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name "$APP_NAME-vnet" \
+  --name containerapps-infra \
+  --query id -o tsv)
+
 az containerapp env create \
   --resource-group $RESOURCE_GROUP \
   --name $ENVIRONMENT \
-  --location $LOCATION
+  --location $LOCATION \
+  --enable-workload-profiles true \
+  --infrastructure-subnet-resource-id "$SUBNET_ID"
 ```
+
+Ingress stays external, so GitHub can still reach the webhook.
+
+> Running this in Git Bash on Windows needs `MSYS_NO_PATHCONV=1` on the
+> `az containerapp env create` line. Git Bash otherwise rewrites the leading
+> slash of `$SUBNET_ID` into a Windows path and the call fails with
+> `LinkedInvalidPropertyId`. Do not export it globally, or paths that genuinely
+> need translating (such as `--file` arguments) break instead.
 
 ### Deploy the Container App
 
@@ -130,7 +175,7 @@ az containerapp create \
   --image "$GHCR_IMAGE" \
   --target-port 8080 \
   --ingress external \
-  --min-replicas 0 \
+  --min-replicas 1 \
   --max-replicas 1 \
   --secrets \
     github-app-key="$APP_KEY" \
@@ -141,6 +186,11 @@ az containerapp create \
     GITHUB_WEBHOOK_SECRET=secretref:github-webhook-secret \
     RUST_LOG=info
 ```
+
+> `--min-replicas` is 1 rather than 0 deliberately. Scaling to zero makes the
+> next webhook wait for a cold start, measured at over 20s, while GitHub gives
+> up after about 10s and does not retry. That silently dropped roughly 10% of
+> deliveries.
 
 ### Get the ingress URL and update the GitHub App
 
