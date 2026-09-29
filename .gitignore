@@ -4,3 +4,6 @@
 *.pem
 webhook-token.txt
 data.txt
+
+# Generated deploy script with embedded credentials - never commit
+dev/deploy-corp-with-key.sh
