@@ -8,7 +8,8 @@ use crate::config::Config;
 use crate::repo_config;
 
 /// Lists the PR's issue comments, flagging the ones authored by the bot itself
-/// (`viewerDidAuthor`) and the ones already hidden (`isMinimized`).
+/// (`viewerDidAuthor`) and the ones already hidden (`isMinimized`). The body is
+/// needed to recognise which artifact a comment was posted for.
 const LIST_COMMENTS_QUERY: &str = r#"
 query ListComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
@@ -20,6 +21,7 @@ query ListComments($owner: String!, $repo: String!, $number: Int!, $cursor: Stri
         }
         nodes {
           id
+          body
           isMinimized
           viewerDidAuthor
         }
@@ -38,6 +40,29 @@ mutation MinimizeComment($subjectId: ID!) {
   }
 }
 "#;
+
+/// Every job in a workflow run reports completion separately, and with the
+/// default `job_filter` of `.*` each one matches. They all resolve to the same
+/// artifact, so without a guard the same content gets posted once per job.
+///
+/// Each comment therefore records which artifact produced it, and an artifact
+/// that already has a comment is never posted again.
+fn artifact_marker(artifact_id: u64) -> String {
+    format!("<!-- hyperlight-gh-bot:artifact={artifact_id} -->")
+}
+
+/// Serialises the check-and-post section. Jobs can finish simultaneously, and
+/// the marker alone cannot stop two handlers that both look before either
+/// writes. The bot runs as a single replica, so an in-process lock closes that
+/// window; the marker still covers restarts and redeployments.
+static POST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A PR comment as needed for deduplication and hiding.
+struct BotComment {
+    node_id: String,
+    body: String,
+    is_minimized: bool,
+}
 
 /// Downloads the comment artifact from a workflow run and posts it to the associated PR.
 /// The artifact is expected to be a zip containing a single text file with the comment body.
@@ -92,9 +117,8 @@ pub async fn try_post_benchmark_comment(
     // Download the artifact content — this is the comment body
     let body = download_artifact_text(&octocrab, owner, repo, artifact_id).await?;
 
-    post_pr_comment(&octocrab, owner, repo, pr_number, &body).await?;
+    post_pr_comment(&octocrab, owner, repo, pr_number, &body, artifact_id).await?;
 
-    tracing::info!("Posted comment on PR #{pr_number}");
     Ok(())
 }
 
@@ -186,41 +210,61 @@ async fn download_artifact_text(
     Ok(content)
 }
 
-/// Creates a new comment on the PR, then hides the bot's previous comments as outdated.
+/// Creates a comment for this artifact unless one already exists, then hides the
+/// bot's earlier comments as outdated.
 async fn post_pr_comment(
     octocrab: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
     pr_number: u64,
     body: &str,
+    artifact_id: u64,
 ) -> Result<()> {
-    let new_comment = octocrab
+    let marker = artifact_marker(artifact_id);
+
+    // Held across the whole check-and-post so two jobs finishing together
+    // cannot both decide the artifact is unposted.
+    let guard = POST_LOCK.lock().await;
+
+    // Listing before posting means the new comment cannot appear in the set,
+    // so there is no need to filter it back out afterwards.
+    let existing = list_pr_comments(octocrab, owner, repo, pr_number).await?;
+
+    if existing.iter().any(|c| c.body.contains(&marker)) {
+        tracing::info!("Artifact {artifact_id} already has a comment on PR #{pr_number}, skipping");
+        return Ok(());
+    }
+
+    octocrab
         .issues(owner, repo)
-        .create_comment(pr_number, body)
+        .create_comment(pr_number, format!("{body}\n\n{marker}"))
         .await
         .context("Failed to create comment")?;
 
-    // The comment is already published, so a cleanup failure must not fail the whole run.
-    if let Err(e) =
-        hide_previous_comments(octocrab, owner, repo, pr_number, &new_comment.node_id).await
-    {
+    tracing::info!("Posted comment for artifact {artifact_id} on PR #{pr_number}");
+
+    // Past the point another handler could duplicate this artifact, so let
+    // other pull requests proceed instead of waiting on the hiding below.
+    drop(guard);
+
+    // The comment is already published, so a cleanup failure must not fail the
+    // whole run.
+    if let Err(e) = hide_comments(octocrab, &existing, pr_number).await {
         tracing::warn!("Failed to hide previous bot comments on PR #{pr_number}: {e:#}");
     }
 
     Ok(())
 }
 
-/// Minimizes every not-yet-hidden comment the bot previously authored on the PR,
-/// skipping the comment that was just created.
-async fn hide_previous_comments(
+/// Fetches every comment on the PR, following pagination.
+async fn list_pr_comments(
     octocrab: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
     pr_number: u64,
-    new_comment_node_id: &str,
-) -> Result<()> {
+) -> Result<Vec<BotComment>> {
     let mut cursor: Option<String> = None;
-    let mut stale_comment_ids = Vec::new();
+    let mut out = Vec::new();
 
     loop {
         let response: serde_json::Value = octocrab
@@ -243,11 +287,14 @@ async fn hide_previous_comments(
             let Some(id) = node["id"].as_str() else {
                 continue;
             };
-            let authored_by_bot = node["viewerDidAuthor"] == true;
-            let already_hidden = node["isMinimized"] == true;
-            if authored_by_bot && !already_hidden && id != new_comment_node_id {
-                stale_comment_ids.push(id.to_owned());
+            if node["viewerDidAuthor"] != true {
+                continue;
             }
+            out.push(BotComment {
+                node_id: id.to_owned(),
+                body: node["body"].as_str().unwrap_or_default().to_owned(),
+                is_minimized: node["isMinimized"] == true,
+            });
         }
 
         if comments["pageInfo"]["hasNextPage"] != true {
@@ -261,17 +308,28 @@ async fn hide_previous_comments(
         }
     }
 
+    Ok(out)
+}
+
+/// Minimizes each of the given comments that is not already hidden.
+async fn hide_comments(
+    octocrab: &octocrab::Octocrab,
+    comments: &[BotComment],
+    pr_number: u64,
+) -> Result<()> {
+    let stale: Vec<&BotComment> = comments.iter().filter(|c| !c.is_minimized).collect();
+
     let mut hidden = 0;
-    for id in &stale_comment_ids {
-        match minimize_comment_as_outdated(octocrab, id).await {
+    for c in &stale {
+        match minimize_comment_as_outdated(octocrab, &c.node_id).await {
             Ok(()) => hidden += 1,
-            Err(e) => tracing::warn!("Failed to hide previous bot comment {id}: {e:#}"),
+            Err(e) => tracing::warn!("Failed to hide previous bot comment {}: {e:#}", c.node_id),
         }
     }
 
     tracing::info!(
         "Hid {hidden} of {} previous bot comment(s) on PR #{pr_number}",
-        stale_comment_ids.len()
+        stale.len()
     );
 
     Ok(())
@@ -311,7 +369,9 @@ fn check_graphql_errors(response: &serde_json::Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_graphql_errors, LIST_COMMENTS_QUERY, MINIMIZE_COMMENT_MUTATION};
+    use super::{
+        artifact_marker, check_graphql_errors, LIST_COMMENTS_QUERY, MINIMIZE_COMMENT_MUTATION,
+    };
 
     #[test]
     fn minimize_mutation_uses_outdated_classifier() {
@@ -320,10 +380,34 @@ mod tests {
     }
 
     #[test]
-    fn list_query_requests_authorship_and_minimized_state() {
+    fn list_query_requests_the_fields_dedup_and_hiding_need() {
         assert!(LIST_COMMENTS_QUERY.contains("viewerDidAuthor"));
         assert!(LIST_COMMENTS_QUERY.contains("isMinimized"));
         assert!(LIST_COMMENTS_QUERY.contains("hasNextPage"));
+        // The body carries the artifact marker.
+        assert!(LIST_COMMENTS_QUERY.contains("body"));
+    }
+
+    #[test]
+    fn artifact_marker_is_hidden_and_distinguishes_artifacts() {
+        let m = artifact_marker(4242);
+        assert!(
+            m.starts_with("<!--") && m.ends_with("-->"),
+            "must be an HTML comment"
+        );
+        assert!(m.contains("4242"));
+        assert_ne!(m, artifact_marker(4243));
+    }
+
+    #[test]
+    fn a_body_is_matched_only_by_its_own_artifact_marker() {
+        let body = format!("## Benchmark Results\n\n{}", artifact_marker(100));
+        assert!(body.contains(&artifact_marker(100)));
+        assert!(!body.contains(&artifact_marker(101)));
+        // A marker must not match a longer id that merely starts the same way.
+        assert!(!body.contains(&artifact_marker(1000)));
+        // A comment predating this change has no marker at all.
+        assert!(!"## Benchmark Results".contains(&artifact_marker(100)));
     }
 
     #[test]
