@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The Hyperlight Authors.
+
 use anyhow::{Context, Result};
 use octocrab::Octocrab;
 use regex::Regex;
