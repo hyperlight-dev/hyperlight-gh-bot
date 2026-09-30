@@ -79,6 +79,12 @@ The container image is built and pushed to GHCR automatically by the **Publish i
 
 You can also trigger it manually from the Actions tab.
 
+> The GHCR package must be **public**. The Container App is created without
+> registry credentials and pulls anonymously, including when it restarts or is
+> rescheduled, so a private package leaves it unable to start. New packages
+> default to private, so check visibility after the first publish under
+> the organization's Packages settings.
+
 ### Create Key Vault and store secrets
 
 This is the one-time bootstrap: it is the only step that needs the `.pem` file
